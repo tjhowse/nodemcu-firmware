@@ -99,7 +99,7 @@ typedef enum
 }
 tcs34725Gain_t;
 static void temp_setup_debug(int line, const char *str);
-uint8_t tcs34725Init(lua_State* L);
+uint8_t tcs34725Setup(lua_State* L);
 uint8_t tcs34725Enable(lua_State* L);
 uint8_t tcs34725Disable(lua_State* L);
 uint8_t tcs34725GetRawData(lua_State* L);
@@ -114,6 +114,7 @@ static tcs34725Gain_t				_tcs34725Gain = TCS34725_GAIN_1X;
 static tcs34725IntegrationTime_t	_tcs34725IntegrationTime = TCS34725_INTEGRATIONTIME_2_4MS;
 
 os_timer_t tcs34725_timer; // timer for forced mode readout
+sint32_t cb_tcs_en;
 
 /**************************************************************************/
 /*!
@@ -158,30 +159,22 @@ uint8_t tcs34725Read8(uint8_t reg)
 */
 /**************************************************************************/
 uint16_t tcs34725Read16(uint8_t reg)
-{	
-	uint8_t low = 0x00;
-	uint8_t high = 0x00;
-	platform_i2c_send_start(TCS34725_BUS_ID);
-	platform_i2c_send_address(TCS34725_BUS_ID, TCS34725_ADDRESS, PLATFORM_I2C_DIRECTION_TRANSMITTER);
-	platform_i2c_send_byte(TCS34725_BUS_ID, TCS34725_COMMAND_BIT | reg);
-	platform_i2c_send_stop(TCS34725_BUS_ID);
+{		
+	uint8_t low = tcs34725Read8(reg);
+	uint8_t high = tcs34725Read8(++reg);
 	
-	platform_i2c_send_start(TCS34725_BUS_ID);
-	platform_i2c_send_address(TCS34725_BUS_ID, TCS34725_ADDRESS, PLATFORM_I2C_DIRECTION_RECEIVER);
-	low = platform_i2c_recv_byte(TCS34725_BUS_ID, 1);
-	high = platform_i2c_recv_byte(TCS34725_BUS_ID, 0);
-	platform_i2c_send_stop(TCS34725_BUS_ID);
-	
-	return (high << 8) | low;;
+	return (high << 8) | low;
 }
 /**************************************************************************/
 /*!
 		@brief	Finishes enabling the device
 */
 /**************************************************************************/
-uint8_t tcs34725EnableDone(lua_State* L)
+uint8_t tcs34725EnableDone()
 {
-	dbg_printf("Enable second bit\n");
+	dbg_printf("Enable finished\n");
+	lua_State *L = lua_getstate();
+	os_timer_disarm (&tcs34725_timer);
 	tcs34725Write8(TCS34725_ENABLE, TCS34725_ENABLE_PON | TCS34725_ENABLE_AEN);
 
 	/* Ready to go ... set the initialised flag */
@@ -189,7 +182,13 @@ uint8_t tcs34725EnableDone(lua_State* L)
 	
 	/* This needs to take place after the initialisation flag! */
 	tcs34725SetIntegrationTime(TCS34725_INTEGRATIONTIME_2_4MS, L);
-	tcs34725SetGain(TCS34725_GAIN_60X, L);
+	tcs34725SetGain(TCS34725_GAIN_60X, L);	
+	
+	lua_rawgeti(L, LUA_REGISTRYINDEX, cb_tcs_en); // Get the callback to call
+	luaL_unref(L, LUA_REGISTRYINDEX, cb_tcs_en); // Unregister the callback to avoid leak
+	cb_tcs_en = LUA_NOREF;
+	lua_call(L, 0, 0);
+	
 	return 0;
 }
 
@@ -200,11 +199,22 @@ uint8_t tcs34725EnableDone(lua_State* L)
 /**************************************************************************/
 uint8_t tcs34725Enable(lua_State* L)
 {
-	dbg_printf("Enable first bit\n");
+	dbg_printf("Enable begun\n");
+
+	if (lua_type(L, 1) == LUA_TFUNCTION || lua_type(L, 1) == LUA_TLIGHTFUNCTION) {
+		if (cb_tcs_en != LUA_NOREF) {
+			luaL_unref(L, LUA_REGISTRYINDEX, cb_tcs_en);
+		}
+		lua_pushvalue(L, 1);
+		cb_tcs_en = luaL_ref(L, LUA_REGISTRYINDEX);
+	} else {
+		return luaL_error(L, "Enable argument must be a function.");
+	}
+	
 	tcs34725Write8(TCS34725_ENABLE, TCS34725_ENABLE_PON);
 	// Start a timer to wait TCS34725_EN_DELAY before calling tcs34725EnableDone
 	os_timer_disarm (&tcs34725_timer);
-	os_timer_setfn (&tcs34725_timer, (os_timer_func_t *)tcs34725EnableDone, L);
+	os_timer_setfn (&tcs34725_timer, (os_timer_func_t *)tcs34725EnableDone, NULL);
 	os_timer_arm (&tcs34725_timer, TCS34725_EN_DELAY, 0); // trigger callback when readout is ready
 
 	return 0;
@@ -221,7 +231,7 @@ uint8_t tcs34725Disable(lua_State* L)
 	uint8_t reg = 0;
 	reg = tcs34725Read8(TCS34725_ENABLE);
 	tcs34725Write8(TCS34725_ENABLE, reg & ~(TCS34725_ENABLE_PON | TCS34725_ENABLE_AEN));
-
+	_tcs34725Initialised = false;
 	return 0;
 }
 
@@ -230,42 +240,17 @@ uint8_t tcs34725Disable(lua_State* L)
 		@brief	Initialises the I2C block
 */
 /**************************************************************************/
-uint8_t tcs34725Init(lua_State* L)
+uint8_t tcs34725Setup(lua_State* L)
 {
-	int lua_dbg_cb_ref;
 	uint8_t id = 0;
-	uint8_t sda;
-	uint8_t scl;
-	uint8_t config;
-	uint8_t ack;
 
-	if (!lua_isnumber(L, 1) || !lua_isnumber(L, 2)) {
-		return luaL_error(L, "wrong arg range");
-	}
-	sda = luaL_checkinteger(L, 1);
-	scl = luaL_checkinteger(L, 2);
-	platform_i2c_setup(TCS34725_BUS_ID, sda, scl, PLATFORM_I2C_SPEED_SLOW);
-	
 	/* Make sure we have the right IC (0x44 = TCS34725 and TCS34721) */
 	id = tcs34725Read8(TCS34725_ID);
 	dbg_printf("id: %x\n",id);
 	if (id != 0x44) {
-		luaL_error(L, "No TCS34725 found.");
-		return 0;
-	}
-
-	/* Enable the device */
-	// TODO this doesn't quite work as it should. Enable is non-blocking.
-	if (tcs34725Enable(L) != 0) {
-		luaL_error(L, "TCS34725 Not initialising.");
-		return 0;
+		return luaL_error(L, "No TCS34725 found.");
 	}
 	
-	// TODO Block here and wait for _tcs34725Initialised?
-
-	/* This needs to take place after the initialisation flag! */
-	// tcs34725SetIntegrationTime(TCS34725_INTEGRATIONTIME_2_4MS, L);
-	// tcs34725SetGain(TCS34725_GAIN_60X, L);
 	lua_pushinteger(L, 1);
 	return 1;
 }
@@ -290,7 +275,7 @@ uint8_t tcs34725SetIntegrationTime(tcs34725IntegrationTime_t it, lua_State* L)
 {
 	if (!_tcs34725Initialised)
 	{
-		tcs34725Init(L);
+		tcs34725Setup(L);
 	}
 
 	tcs34725Write8(TCS34725_ATIME, it);
@@ -317,15 +302,15 @@ uint8_t tcs34725LuaSetGain(lua_State* L)
 /**************************************************************************/
 uint8_t tcs34725SetGain(tcs34725Gain_t gain, lua_State* L)
 {
-  if (!_tcs34725Initialised)
-  {
-    tcs34725Init(L);
-  }
+	if (!_tcs34725Initialised)
+	{
+		return luaL_error(L, "TCS34725 not initialised.");
+	}
 
-  tcs34725Write8(TCS34725_CONTROL, gain);
-  _tcs34725Gain = gain;
+	tcs34725Write8(TCS34725_CONTROL, gain);
+	_tcs34725Gain = gain;
 
-  return 0;
+	return 0;
 }
 
 /**************************************************************************/
@@ -342,10 +327,9 @@ uint8_t tcs34725GetRawData(lua_State* L)
 	
 	if (!_tcs34725Initialised)
 	{
-		tcs34725Init(L);
+		return luaL_error(L, "TCS34725 not initialised.");
 	}
 
-	/* ToDo: Insert a blocky delay until the data is ready! */
 	c = tcs34725Read16(TCS34725_CDATAL);
 	r = tcs34725Read16(TCS34725_RDATAL);
 	g = tcs34725Read16(TCS34725_GDATAL);
@@ -359,7 +343,7 @@ uint8_t tcs34725GetRawData(lua_State* L)
 
 
 static const LUA_REG_TYPE tcs34725_map[] = {
-	{ LSTRKEY( "init" ), LFUNCVAL(tcs34725Init)},
+	{ LSTRKEY( "setup" ), LFUNCVAL(tcs34725Setup)},
 	{ LSTRKEY( "enable" ),  LFUNCVAL(tcs34725Enable)},
 	{ LSTRKEY( "disable" ),  LFUNCVAL(tcs34725Disable)},
 	{ LSTRKEY( "raw" ),  LFUNCVAL(tcs34725GetRawData)},

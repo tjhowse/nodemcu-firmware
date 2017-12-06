@@ -8,7 +8,6 @@
 #include "c_string.h"
 #include "ets_sys.h"
 #include "time.h"
-#include "rtc/rtctime_internal.h"
 #include "rtc/rtctime.h"
 #include "stdlib.h"
 #include "mem.h"
@@ -53,7 +52,7 @@ static uint64_t lcron_parsepart(lua_State *L, char *str, char **end, uint8_t min
       if (val < min || val > max) {
         return luaL_error(L, "invalid spec (val %d out of range %d..%d)", val, min, max);
       }
-      res |= (1 << (val - min));
+      res |= (uint64_t)1 << (val - min);
       if (**end != ',') break;
       str = *end + 1;
     }
@@ -67,11 +66,11 @@ static int lcron_parsedesc(lua_State *L, char *str, struct cronent_desc *desc) {
   if (*s != ' ') return luaL_error(L, "invalid spec (separator @%d)", s - str);
   desc->hour = lcron_parsepart(L, s + 1, &s, 0, 23);
   if (*s != ' ') return luaL_error(L, "invalid spec (separator @%d)", s - str);
-  desc->dow = lcron_parsepart(L, s + 1, &s, 0, 6);
-  if (*s != ' ') return luaL_error(L, "invalid spec (separator @%d)", s - str);
   desc->dom = lcron_parsepart(L, s + 1, &s, 1, 31);
   if (*s != ' ') return luaL_error(L, "invalid spec (separator @%d)", s - str);
   desc->mon = lcron_parsepart(L, s + 1, &s, 1, 12);
+  if (*s != ' ') return luaL_error(L, "invalid spec (separator @%d)", s - str);
+  desc->dow = lcron_parsepart(L, s + 1, &s, 0, 6);
   if (*s != 0) return luaL_error(L, "invalid spec (trailing @%d)", s - str);
   return 0;
 }
@@ -189,7 +188,7 @@ static void cron_handle_time(uint8_t mon, uint8_t dom, uint8_t dow, uint8_t hour
 
 static void cron_handle_tmr() {
   struct rtc_timeval tv;
-  rtc_time_gettimeofday(&tv);
+  rtctime_gettimeofday(&tv);
   if (tv.tv_sec == 0) { // Wait for RTC time
     ets_timer_arm_new(&cron_timer, 1000, 0, 1);
     return;
